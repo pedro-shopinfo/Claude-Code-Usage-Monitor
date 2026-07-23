@@ -1,0 +1,27 @@
+name: Build sem auto-update
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v4
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compilar
+        run: cargo build --release --locked
+
+      - name: Disponibilizar executável
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-code-usage-monitor-no-update
+          path: target/release/claude-code-usage-monitor.exe
