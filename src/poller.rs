@@ -12,6 +12,10 @@ use std::os::windows::process::CommandExt;
 use crate::diagnose;
 use crate::localization::Strings;
 use crate::models::{AppUsageData, UsageData, UsageSection};
+use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows::Win32::System::Time::{
+    FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime,
+};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -1521,15 +1525,117 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Format a usage section as "X% · Yh" style text
+/// Format a usage section as "X% · HH:MMh" or
+/// "X% · seg. HHhMM" when the reset happens on another day.
 pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     let pct = format!("{:.0}%", section.percentage);
-    let cd = format_countdown(section.resets_at, strings);
-    if cd.is_empty() {
+    let reset_text = format_reset_clock(section.resets_at, strings);
+
+    if reset_text.is_empty() {
         pct
     } else {
-        format!("{pct} \u{00b7} {cd}")
+        format!("{pct} \u{00b7} {reset_text}")
     }
+}
+const WEEKDAYS_PT: [&str; 7] = [
+    "dom.",
+    "seg.",
+    "ter.",
+    "qua.",
+    "qui.",
+    "sex.",
+    "sáb.",
+];
+
+fn format_reset_clock(resets_at: Option<SystemTime>, strings: Strings) -> String {
+    let reset = match resets_at {
+        Some(reset) => reset,
+        None => return String::new(),
+    };
+
+    let now = SystemTime::now();
+
+    // O horário de reset já passou.
+    if now.duration_since(reset).is_ok() {
+        return strings.now.to_string();
+    }
+
+    let reset_local = match system_time_to_local(&reset) {
+        Some(time) => time,
+        None => return format_countdown(Some(reset), strings),
+    };
+
+    let now_local = match system_time_to_local(&now) {
+        Some(time) => time,
+        None => return format_countdown(Some(reset), strings),
+    };
+
+    let reset_is_today = reset_local.wYear == now_local.wYear
+        && reset_local.wMonth == now_local.wMonth
+        && reset_local.wDay == now_local.wDay;
+
+    if reset_is_today {
+        format!(
+            "{:02}:{:02}h",
+            reset_local.wHour,
+            reset_local.wMinute
+        )
+    } else {
+        let weekday = WEEKDAYS_PT
+            .get(reset_local.wDayOfWeek as usize)
+            .copied()
+            .unwrap_or("");
+
+        if weekday.is_empty() {
+            format!(
+                "{:02}h{:02}",
+                reset_local.wHour,
+                reset_local.wMinute
+            )
+        } else {
+            format!(
+                "{weekday} {:02}h{:02}",
+                reset_local.wHour,
+                reset_local.wMinute
+            )
+        }
+    }
+}
+
+fn system_time_to_local(time: &SystemTime) -> Option<SYSTEMTIME> {
+    // FILETIME conta intervalos de 100 nanossegundos desde 01/01/1601.
+    const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+    const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
+
+    let unix_duration = time.duration_since(UNIX_EPOCH).ok()?;
+
+    let filetime_ticks = unix_duration
+        .as_secs()
+        .checked_add(WINDOWS_TO_UNIX_EPOCH_SECONDS)?
+        .checked_mul(WINDOWS_TICKS_PER_SECOND)?
+        .checked_add(u64::from(unix_duration.subsec_nanos()) / 100)?;
+
+    let file_time = FILETIME {
+        dwLowDateTime: filetime_ticks as u32,
+        dwHighDateTime: (filetime_ticks >> 32) as u32,
+    };
+
+    let mut utc_time = SYSTEMTIME::default();
+    let mut local_time = SYSTEMTIME::default();
+
+    unsafe {
+        FileTimeToSystemTime(&file_time, &mut utc_time).ok()?;
+
+        // None faz o Windows usar o fuso horário atualmente configurado.
+        SystemTimeToTzSpecificLocalTime(
+            None,
+            &utc_time,
+            &mut local_time,
+        )
+        .ok()?;
+    }
+
+    Some(local_time)
 }
 
 fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
