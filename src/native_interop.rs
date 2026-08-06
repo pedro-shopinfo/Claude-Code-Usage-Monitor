@@ -28,6 +28,7 @@ pub const WM_APP_TRAY: u32 = WM_APP + 3;
 pub struct TaskbarWindow {
     pub hwnd: HWND,
     pub rect: RECT,
+    pub is_primary: bool,
 }
 
 pub fn find_taskbars() -> Vec<TaskbarWindow> {
@@ -39,7 +40,11 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
             let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
             if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
                 if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
-                    taskbars.push(TaskbarWindow { hwnd, rect });
+                    taskbars.push(TaskbarWindow {
+                        hwnd,
+                        rect,
+                        is_primary: class_name == "Shell_TrayWnd",
+                    });
                 }
             }
         }
@@ -52,6 +57,7 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
     }
     taskbars.sort_by_key(|taskbar| {
         (
+            !taskbar.is_primary,
             taskbar.rect.top,
             taskbar.rect.left,
             taskbar.rect.bottom,
@@ -60,7 +66,12 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
     });
     taskbars
 }
-
+/// Retorna a barra de tarefas da tela principal do Windows.
+pub fn find_primary_taskbar() -> Option<TaskbarWindow> {
+    find_taskbars()
+        .into_iter()
+        .find(|taskbar| taskbar.is_primary)
+}
 /// Find a child window by class name
 pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
     unsafe {
