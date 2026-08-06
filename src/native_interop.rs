@@ -55,6 +55,9 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
     unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut taskbars as *mut _ as isize));
     }
+    // Keep the Windows primary taskbar first. Sorting only by screen coordinates
+    // can incorrectly put a secondary monitor first when it is positioned above or
+    // to the left of the primary display.
     taskbars.sort_by_key(|taskbar| {
         (
             !taskbar.is_primary,
@@ -66,12 +69,14 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
     });
     taskbars
 }
-/// Retorna a barra de tarefas da tela principal do Windows.
+
+/// Return the taskbar that belongs to the Windows primary display.
 pub fn find_primary_taskbar() -> Option<TaskbarWindow> {
     find_taskbars()
         .into_iter()
         .find(|taskbar| taskbar.is_primary)
 }
+
 /// Find a child window by class name
 pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
     unsafe {
