@@ -496,23 +496,19 @@ fn toggle_widget_visibility(hwnd: HWND) {
 
 fn attach_to_taskbar(hwnd: HWND, _requested_index: usize) -> bool {
     let taskbars = native_interop::find_taskbars();
-
     if taskbars.is_empty() {
         diagnose::log("taskbar not found; using fallback popup window");
         return false;
     }
 
-    // Sempre utiliza a barra da tela principal do Windows.
-    // O índice salvo anteriormente é ignorado para impedir que o widget
-    // volte para uma tela secundária ao iniciar.
-    let taskbar = native_interop::find_primary_taskbar()
-        .unwrap_or(taskbars[0]);
-
+    // Always bind the widget to the Windows primary taskbar (Shell_TrayWnd).
+    // The persisted index is intentionally ignored so an old setting cannot send
+    // the widget back to a secondary monitor on the next launch.
+    let taskbar = native_interop::find_primary_taskbar().unwrap_or(taskbars[0]);
     let index = taskbars
         .iter()
         .position(|candidate| candidate.hwnd == taskbar.hwnd)
         .unwrap_or(0);
-
     diagnose::log(format!(
         "primary taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
         taskbars.len(),
@@ -523,45 +519,43 @@ fn attach_to_taskbar(hwnd: HWND, _requested_index: usize) -> bool {
         taskbar.rect.bottom
     ));
 
-    unsafe {
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let new_style =
-            (style & !native_interop::WS_POPUP_STYLE)
-                | native_interop::WS_CHILD_STYLE
-                | native_interop::WS_CLIPSIBLINGS_STYLE;
-
-        let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
+    let old_hook = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|s| s.win_event_hook.take())
+    };
+    if let Some(hook) = old_hook {
+        native_interop::unhook_win_event(hook);
     }
 
     native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
 
-    let tray_notify = native_interop::find_child_window(
-        taskbar.hwnd,
-        "TrayNotifyWnd",
-    );
-
-    let event_hook = tray_notify.and_then(|tray_hwnd| {
-        native_interop::set_location_change_hook(
-            tray_hwnd,
-            Some(tray_location_changed),
-        )
-    });
-
-    {
-        let mut state = lock_state();
-
-        if let Some(s) = state.as_mut() {
-            s.taskbar_hwnd = Some(taskbar.hwnd);
-            s.tray_notify_hwnd = tray_notify;
-            s.win_event_hook = event_hook;
-            s.taskbar_index = index;
-            s.embedded = true;
-        }
+    let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
+    if tray_notify.is_some() {
+        diagnose::log("TrayNotifyWnd found");
+    } else {
+        diagnose::log("TrayNotifyWnd not found");
     }
 
+    let hook = tray_notify.and_then(|tray_hwnd| {
+        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
+        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
+    });
+    if hook.is_some() {
+        diagnose::log("tray event hook installed");
+    } else {
+        diagnose::log("tray event hook could not be installed");
+    }
+
+    let mut state = lock_state();
+    if let Some(s) = state.as_mut() {
+        s.taskbar_hwnd = Some(taskbar.hwnd);
+        s.tray_notify_hwnd = tray_notify;
+        s.win_event_hook = hook;
+        s.taskbar_index = index;
+        s.embedded = true;
+    }
     true
 }
-
 
 fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
     let mut tray_left = taskbar_rect.right;
@@ -1320,8 +1314,6 @@ pub fn run() {
         // Try to embed in taskbar
         if attach_to_taskbar(hwnd, settings.taskbar_index) {
             embedded = true;
-        
-            // Sobrescreve o índice antigo que poderia apontar para outra tela.
             save_state_settings();
         }
 
@@ -2445,30 +2437,27 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let drag_finished = {
+            let drag_result = {
                 let mut state = lock_state();
-        
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
                         s.dragging = false;
-                        true
+                        Some(())
                     } else {
-                        false
+                        None
                     }
                 } else {
-                    false
+                    None
                 }
             };
-        
-            if drag_finished {
+            if drag_result.is_some() {
                 let _ = ReleaseCapture();
-        
-                // Reposiciona novamente usando a barra principal.
-                // O arraste somente altera o deslocamento horizontal.
+                // Keep the widget locked to the primary taskbar. Dragging still
+                // changes its horizontal offset, but dropping over another monitor
+                // can no longer re-parent it to a secondary taskbar.
                 position_at_taskbar();
                 save_state_settings();
             }
-        
             LRESULT(0)
         }
         WM_RBUTTONUP => {
