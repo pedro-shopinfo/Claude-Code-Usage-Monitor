@@ -84,6 +84,7 @@ struct AppState {
     last_update_check_unix: Option<u64>,
 
     taskbar_index: usize,
+    target_monitor_device: Option<String>,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
@@ -234,22 +235,39 @@ fn relaunch_self() {
 fn spawn_taskbar_watchdog() {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let stored = {
+
+        let (stored_taskbar, target_monitor_device) = {
             let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
+            match state.as_ref() {
+                Some(s) => (s.taskbar_hwnd, s.target_monitor_device.clone()),
+                None => continue,
+            }
         };
-        // Only relevant once we have embedded into a taskbar at least once.
-        let Some(old) = stored else {
-            continue;
+
+        // The first successful attachment records the exact display device
+        // (for example \\.\DISPLAY1). From that point on, never follow a
+        // temporary change to Windows' primary-monitor flag.
+        let target_taskbar = match target_monitor_device.as_deref() {
+            Some(device_name) => native_interop::find_taskbar_for_monitor_device(device_name),
+            None => native_interop::find_primary_taskbar(),
         };
-        let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
-            let new = taskbars[0].hwnd;
-            diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                old.0, new.0
-            ));
-            relaunch_self();
+
+        match (stored_taskbar, target_taskbar) {
+            (Some(old), Some(target)) if old != target.hwnd => {
+                diagnose::log(format!(
+                    "watchdog: locked taskbar changed old={:?} new={:?} monitor={:?} -> relaunching",
+                    old.0, target.hwnd.0, target_monitor_device
+                ));
+                relaunch_self();
+            }
+            (None, Some(target)) => {
+                diagnose::log(format!(
+                    "watchdog: locked taskbar became available hwnd={:?} monitor={:?} -> relaunching",
+                    target.hwnd.0, target_monitor_device
+                ));
+                relaunch_self();
+            }
+            _ => {}
         }
     });
 }
@@ -302,6 +320,8 @@ struct SettingsFile {
     tray_offset: i32,
     #[serde(default)]
     taskbar_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_monitor_device: Option<String>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -323,6 +343,7 @@ impl Default for SettingsFile {
         Self {
             tray_offset: 0,
             taskbar_index: 0,
+            target_monitor_device: None,
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
@@ -382,6 +403,7 @@ fn save_state_settings() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
+            target_monitor_device: s.target_monitor_device.clone(),
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
@@ -501,18 +523,40 @@ fn attach_to_taskbar(hwnd: HWND, _requested_index: usize) -> bool {
         return false;
     }
 
-    // Always bind the widget to the Windows primary taskbar (Shell_TrayWnd).
-    // The persisted index is intentionally ignored so an old setting cannot send
-    // the widget back to a secondary monitor on the next launch.
-    let taskbar = native_interop::find_primary_taskbar().unwrap_or(taskbars[0]);
+    let locked_monitor_device = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .and_then(|s| s.target_monitor_device.clone())
+    };
+
+    // After the first successful launch, bind to the exact display device that
+    // was selected then. Do not follow Shell_TrayWnd if Windows temporarily
+    // moves the primary-taskbar role to another monitor.
+    let taskbar = if let Some(device_name) = locked_monitor_device.as_deref() {
+        match native_interop::find_taskbar_for_monitor_device(device_name) {
+            Some(taskbar) => taskbar,
+            None => {
+                diagnose::log(format!(
+                    "locked monitor taskbar unavailable monitor={device_name}; refusing secondary fallback"
+                ));
+                return false;
+            }
+        }
+    } else {
+        native_interop::find_primary_taskbar().unwrap_or(taskbars[0])
+    };
+
+    let selected_monitor_device = native_interop::monitor_device_name(taskbar.hwnd);
     let index = taskbars
         .iter()
         .position(|candidate| candidate.hwnd == taskbar.hwnd)
         .unwrap_or(0);
     diagnose::log(format!(
-        "primary taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
+        "locked taskbar selected index={index} count={} hwnd={:?} monitor={:?} rect=({}, {}, {}, {})",
         taskbars.len(),
         taskbar.hwnd,
+        selected_monitor_device,
         taskbar.rect.left,
         taskbar.rect.top,
         taskbar.rect.right,
@@ -552,6 +596,9 @@ fn attach_to_taskbar(hwnd: HWND, _requested_index: usize) -> bool {
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
         s.taskbar_index = index;
+        if s.target_monitor_device.is_none() {
+            s.target_monitor_device = selected_monitor_device;
+        }
         s.embedded = true;
     }
     true
@@ -1303,6 +1350,7 @@ pub fn run() {
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
+                target_monitor_device: settings.target_monitor_device.clone(),
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
@@ -2046,7 +2094,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, taskbar_hwnd) = {
+    let (hwnd, embedded, tray_offset, taskbar_hwnd, target_monitor_device) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -2066,8 +2114,30 @@ fn position_at_taskbar() {
             }
         };
 
-        (s.hwnd.to_hwnd(), s.embedded, s.tray_offset, taskbar_hwnd)
+        (
+            s.hwnd.to_hwnd(),
+            s.embedded,
+            s.tray_offset,
+            taskbar_hwnd,
+            s.target_monitor_device.clone(),
+        )
     };
+
+    // Never reposition against a taskbar that Windows moved to another display.
+    // The watchdog will relaunch and bind to the taskbar on the locked display.
+    if let Some(target_device) = target_monitor_device.as_deref() {
+        let current_device = native_interop::monitor_device_name(taskbar_hwnd);
+        if !current_device
+            .as_deref()
+            .map(|device| device.eq_ignore_ascii_case(target_device))
+            .unwrap_or(false)
+        {
+            diagnose::log(format!(
+                "position_at_taskbar blocked: taskbar monitor changed target={target_device} current={current_device:?}"
+            ));
+            return;
+        }
+    }
 
     let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
         Some(r) => r,
