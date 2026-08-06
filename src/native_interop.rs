@@ -1,5 +1,8 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFOEXW, MONITOR_DEFAULTTONULL,
+};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -75,6 +78,46 @@ pub fn find_primary_taskbar() -> Option<TaskbarWindow> {
     find_taskbars()
         .into_iter()
         .find(|taskbar| taskbar.is_primary)
+}
+
+/// Return the Windows display device name that owns a window, for example
+/// `\\.\DISPLAY1`. Unlike the primary-display flag, this name remains tied
+/// to the same configured display when Windows temporarily changes which
+/// monitor is considered primary.
+pub fn monitor_device_name(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+        if monitor == Default::default() {
+            return None;
+        }
+
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+            return None;
+        }
+
+        let len = info
+            .szDevice
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(info.szDevice.len());
+        if len == 0 {
+            None
+        } else {
+            Some(String::from_utf16_lossy(&info.szDevice[..len]))
+        }
+    }
+}
+
+/// Find the taskbar that belongs to one exact Windows display device.
+/// This prevents the widget from following a temporary primary-monitor switch.
+pub fn find_taskbar_for_monitor_device(device_name: &str) -> Option<TaskbarWindow> {
+    find_taskbars().into_iter().find(|taskbar| {
+        monitor_device_name(taskbar.hwnd)
+            .map(|name| name.eq_ignore_ascii_case(device_name))
+            .unwrap_or(false)
+    })
 }
 
 /// Find a child window by class name
